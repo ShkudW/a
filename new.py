@@ -539,8 +539,12 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
                           flush=True)
                     break
 
-                op = message["protocolOp"].getComponent()
-                name = op.getName()
+                # getName() must be called on the CHOICE (protocolOp), not on the
+                # already-resolved component (BindResponse / searchResEntry / ...).
+                # The resolved components are Sequence subclasses without getName().
+                protocol_op = message["protocolOp"]
+                name = protocol_op.getName()
+                op = protocol_op.getComponent()
 
                 if name == "bindResponse":
                     print(f"[+]   Bind -> {op['resultCode'].prettyPrint()} "
