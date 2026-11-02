@@ -1,5 +1,16 @@
 # a
 
+
+```
+bloodyAD --host $dc -d $domain -u $username -p $password get writable --detail
+```
+
+```
+ 
+bloodyAD --host 10.129.244.207 -u 'j.arbuckle' -p 'Th1sD4mnC4t!@1978' get object 'CN=Liz Wilson,CN=Users,DC=garfield,DC=htb' --attr 'nTSecurityDescriptor'
+ 
+```
+
 ```
 mkdir switcheroo
 cd switcheroo
