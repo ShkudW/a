@@ -2,6 +2,10 @@
 
 
 ```
+distinguishedName: CN=4b5dc1a3-9310-4eba-bc78-063df97064e8,CN=Packages,CN=Class Store,CN=Machine,CN={21F41D67-D6D9-4B7F-BE7A-88D4CF22E004},CN=Policies,CN=System,DC=ordaprint,DC=local
+
+```
+```
 bloodyAD --host $dc -d $domain -u $username -p $password get writable --detail
 ```
 
