@@ -1,5 +1,10 @@
 # a
 
+
+```
+move "C:\MyFolder\MyFile.txt" "\\ServerName\SharedFolder\MyFile_%RANDOM%.txt"
+
+```
 ```
 [System.IO.File]::Copy("\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SAM", "c:\Windows\Temp\sam.copy")
 
