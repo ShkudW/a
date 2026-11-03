@@ -1,5 +1,13 @@
 # a
+```
+reg load HKLM\RegBack_SAM C:\Windows\System32\config\RegBack\SAM
 
+reg unload HKLM\RegBack_SAM
+
+
+copy C:\Windows\System32\config\RegBack\SAM C:\temp\SAM.hive
+copy C:\Windows\System32\config\RegBack\SYSTEM C:\temp\SYSTEM.hive
+```
 
 ```
 @echo off
